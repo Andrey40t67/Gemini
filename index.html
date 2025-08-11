@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>3D Аватар | Игра с Трекингом Тела</title>
+    <!-- Загрузка MediaPipe для трекинга -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <!-- Загрузка Three.js для 3D Графики (Версия R128) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            color: white;
+            font-family: Arial, sans-serif;
+        }
+        #container {
+            width: 100vw;
+            height: 100vh;
+        }
+        .status-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: rgba(0, 0, 10, 0.95);
+            z-index: 100;
+            transition: opacity 0.5s;
+        }
+        .status-content {
+            text-align: center;
+            padding: 20px 40px;
+            border: 1px solid #00ffff;
+            border-radius: 10px;
+            background-color: #111122;
+            max-width: 500px;
+        }
+        /* Скрываем оригинальное видео, оно нужно только для обработки ИИ */
+        .input_video {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="status-overlay" id="statusOverlay">
+        <div class="status-content" id="statusContent">
+            <h2>Загрузка 3D Движка и Моделей ИИ...</h2>
+            <p>Используется высококачественная модель трекинга. Загрузка может занять некоторое время.</p>
+            <p>Подготовьтесь встать так, чтобы всё ваше тело было видно, и разрешите доступ к камере.</p>
+        </div>
+    </div>
+
+    <div id="container"></div>
+    <video class="input_video" autoplay playsinline></video>
+
+    <script type="module">
+        // --- 1. Глобальные переменные и настройки ---
+        const statusOverlay = document.getElementById('statusOverlay');
+        const statusContent = document.getElementById('statusContent');
+        const container = document.getElementById('container');
+        const videoElement = document.getElementsByClassName('input_video')[0];
+
+        let currentLandmarks = null;
+        let scene, camera, renderer;
+        let avatarGroup;
+        let isLoading = true;
+        let trackingActive = false;
+
+        // Цвета для игры
+        const COLOR_NORMAL = 0x00ffff;
+        const COLOR_JUMP = 0xff00ff;
+        letcurrentColor = COLOR_NORMAL;
+
+        // Хранилище для частей аватара
+        const avatarParts = {};
+        // Соединения скелета по стандарту MediaPipe
+        const POSE_CONNECTIONS = [
+            [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], // Руки и плечи
+            [11, 23], [12, 24], [23, 24],                     // Торс
+            [23, 25], [25, 27], [24, 26], [26, 28]            // Ноги
+        ];
+
+        // --- 2. Инициализация Three.js (Виртуальный мир - Качество) ---
+        function initThreeJS() {
+            // Сцена
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x10101a);
+            scene.fog = new THREE.Fog(0x10101a, 10, 30);
+
+            // Камера
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 1.5, 5); 
+            camera.lookAt(0, 1, 0);
+
+            // Рендерер (Высокое качество)
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.shadowMap.enabled = true; // Включаем тени
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap; // Мягкие тени
+            container.appendChild(renderer.domElement);
+
+            // Освещение
+            const hemiLight = new THREE.HemisphereLight(0xaaaaff, 0x444488, 1.0);
+            hemiLight.position.set(0, 20, 0);
+            scene.add(hemiLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+            dirLight.position.set(5, 10, 7.5);
+            dirLight.castShadow = true;
+            // Настройка качества теней
+            dirLight.shadow.mapSize.width = 2048; 
+            dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.camera.top = 5;
+            dirLight.shadow.camera.bottom = -5;
+            dirLight.shadow.camera.left = -5;
+            dirLight.shadow.camera.right = 5;
+            scene.add(dirLight);
+
+            // Игровой Пол
+            const ground = new THREE.Mesh(
+                new THREE.PlaneGeometry(100, 100),
+                new THREE.MeshPhongMaterial({ color: 0x222233, depthWrite: false })
+            );
+            ground.rotation.x = -Math.PI / 2;
+            ground.receiveShadow = true;
+            scene.add(ground);
+
+            // Сетка для ориентации
+            const grid = new THREE.GridHelper(100, 100, 0x006666, 0x006666);
+            grid.material.opacity = 0.6;
+            grid.material.transparent = true;
+            scene.add(grid);
+
+            // Группа для аватара
+            avatarGroup = new THREE.Group();
+            scene.add(avatarGroup);
+
+            createAvatarPlaceholder();
+
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        // Создание абстрактного аватара (Стилизованный Скелет)
+        function createAvatarPlaceholder() {
+            // Материалы (Используем Phong для свечения)
+            const jointMaterial = new THREE.MeshPhongMaterial({ 
+                color: COLOR_NORMAL, 
+                emissive: COLOR_NORMAL, 
+                emissiveIntensity: 0.3,
+                shininess: 100
+            });
+            const boneMaterial = new THREE.LineBasicMaterial({ color: COLOR_NORMAL, linewidth: 5 });
+            const headMaterial = new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.5 });
+
+            // Создаем "суставы" (сферы)
+            const jointGeometry = new THREE.SphereGeometry(0.05, 16, 16);
+
+            // MediaPipe Pose имеет 33 ключевые точки
+            for (let i = 0; i < 33; i++) {
+                const joint = new THREE.Mesh(jointGeometry, jointMaterial.clone());
+                joint.castShadow = true;
+                joint.visible = false;
+                avatarGroup.add(joint);
+                avatarParts[`joint_${i}`] = joint;
+            }
+
+            // Создаем "кости" (линии)
+            POSE_CONNECTIONS.forEach((conn, index) => {
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+                const bone = new THREE.Line(geometry, boneMaterial.clone());
+                bone.visible = false;
+                avatarGroup.add(bone);
+                avatarParts[`bone_${index}`] = bone;
+            });
+
+             // Добавим голову
+             const headGeometry = new THREE.SphereGeometry(0.15, 32, 32);
+             const head = new THREE.Mesh(headGeometry, headMaterial);
+             head.castShadow = true;
+             head.visible = false;
+             avatarGroup.add(head);
+             avatarParts['head'] = head;
+        }
+
+        // Функция для изменения цвета аватара (Игровая логика)
+        function updateAvatarColor(color) {
+            if (currentColor === color) return;
+            currentColor = color;
+
+            for (let i = 0; i < 33; i++) {
+                const joint = avatarParts[`joint_${i}`];
+                joint.material.color.setHex(color);
+                joint.material.emissive.setHex(color);
+            }
+            
+            POSE_CONNECTIONS.forEach((conn, index) => {
+                const bone = avatarParts[`bone_${index}`];
+                bone.material.color.setHex(color);
+            });
+        }
+
+        // --- 3. Обновление и Анимация ---
+
+        // Основной цикл рендеринга
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Обновляем аватар, если есть данные трекинга
+            if (currentLandmarks) {
+                updateAvatar(currentLandmarks);
+                gameLogic(currentLandmarks);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Функция для преобразования координат MediaPipe в координаты Three.js
+        function landmarkToVector(landmark) {
+            // MediaPipe World Landmarks (в метрах): 
+            // Ось Y направлена вниз. Ось X инвертирована (селфи-камера).
+            return new THREE.Vector3(
+                -landmark.x,
+                -landmark.y,
+                -landmark.z // Инвертируем Z для корректной глубины
+            );
+        }
+
+        // Обновление позиции аватара на основе трекинга
+        function updateAvatar(landmarks) {
+            // Центрирование: Используем точку между бедрами (23 и 24) как центр аватара
+            const hipL = landmarkToVector(landmarks[23]);
+            const hipR = landmarkToVector(landmarks[24]);
+            const center = hipL.clone().lerp(hipR, 0.5);
+
+            // Перемещение аватара по сцене (X и Z). Y (высота) фиксируется на полу (Y=0).
+            avatarGroup.position.x = center.x;
+            avatarGroup.position.z = center.z;
+            avatarGroup.position.y = 0; 
+
+            // Обновляем каждую точку относительно центра группы
+            for (let i = 0; i < landmarks.length; i++) {
+                const joint = avatarParts[`joint_${i}`];
+                if (joint) {
+                    const pos = landmarkToVector(landmarks[i]);
+                    // Устанавливаем позицию относительно центра (center)
+                    joint.position.copy(pos.sub(center));
+                    // Возвращаем оригинальную высоту Y относительно пола
+                    joint.position.y += center.y; 
+
+                    // Показываем точку, только если уверенность трекинга высокая
+                    joint.visible = landmarks[i].visibility > 0.6;
+                }
+            }
+
+            // Обновляем кости (линии)
+            POSE_CONNECTIONS.forEach((conn, index) => {
+                const bone = avatarParts[`bone_${index}`];
+                if (bone) {
+                    const joint1 = avatarParts[`joint_${conn[0]}`];
+                    const joint2 = avatarParts[`joint_${conn[1]}`];
+
+                    if (joint1.visible && joint2.visible) {
+                        bone.visible = true;
+                        const positions = bone.geometry.attributes.position.array;
+                        positions[0] = joint1.position.x;
+                        positions[1] = joint1.position.y;
+                        positions[2] = joint1.position.z;
+                        positions[3] = joint2.position.x;
+                        positions[4] = joint2.position.y;
+                        positions[5] = joint2.position.z;
+                        bone.geometry.attributes.position.needsUpdate = true;
+                    } else {
+                        bone.visible = false;
+                    }
+                }
+            });
+
+            // Обновляем голову (используем точку носа - индекс 0)
+            const head = avatarParts['head'];
+            if (head) {
+                const nose = avatarParts['joint_0'];
+                head.position.copy(nose.position);
+                head.position.y += 0.08; // Немного поднимаем над носом
+                head.visible = nose.visible;
+            }
+        }
+
+        // --- 4. Игровая Логика ---
+        let lastHipY = null;
+        let isJumping = false;
+
+        function gameLogic(landmarks) {
+            // Детектор прыжка по скорости движения бедер
+            const hipL = landmarks[23];
+            const hipR = landmarks[24];
+            // В MediaPipe Y направлен ВНИЗ
+            const currentHipY = (hipL.y + hipR.y) / 2;
+
+            if (lastHipY !== null) {
+                const velocityY = currentHipY - lastHipY;
+
+                // Скорость вверх (значение Y уменьшается)
+                if (velocityY < -0.04) { 
+                    if (!isJumping) {
+                        // Прыжок!
+                        isJumping = true;
+                        updateAvatarColor(COLOR_JUMP);
+                    }
+                } else if (velocityY > 0.03) {
+                    // Приземление
+                    if (isJumping) {
+                        isJumping = false;
+                        updateAvatarColor(COLOR_NORMAL);
+                    }
+                }
+            }
+            lastHipY = currentHipY;
+        }
+
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- 5. Инициализация MediaPipe Pose ---
+
+        // Функция, вызываемая при получении результатов трекинга
+        function onResults(results) {
+             // Скрываем загрузочный экран, когда данные получены
+             if (isLoading) {
+                isLoading = false;
+            }
+
+            // Используем poseWorldLandmarks для получения 3D координат в метрах
+            if (!results.poseWorldLandmarks) {
+                currentLandmarks = null;
+                avatarGroup.visible = false;
+                if (!trackingActive) {
+                    // Показываем сообщение, если трекинг потерян
+                    statusContent.innerHTML = "<h2>Тело не обнаружено</h2><p>Встаньте так, чтобы вас было видно полностью.</p>";
+                    statusOverlay.style.display = 'flex';
+                    statusOverlay.style.opacity = 1;
+                    trackingActive = true; // Считаем, что система активна, но пользователь вне кадра
+                }
+                return;
+            }
+            
+            // Тело найдено
+            if (trackingActive) {
+                 statusOverlay.style.opacity = 0;
+                 setTimeout(() => { statusOverlay.style.display = 'none'; }, 500);
+            }
+
+            avatarGroup.visible = true;
+            currentLandmarks = results.poseWorldLandmarks;
+        }
+
+        const pose = new Pose({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+        }});
+
+        pose.setOptions({
+            modelComplexity: 2, // 0 (быстро), 1 (баланс), 2 (максимальное качество, но медленнее)
+            smoothLandmarks: true,
+            enableSegmentation: false, // Сегментация не нужна, мы рендерим в 3D
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        pose.onResults(onResults);
+
+        // --- 6. Запуск Камеры и Приложения ---
+
+        async function start() {
+            initThreeJS();
+            animate();
+
+            // Запуск камеры и передача потока в MediaPipe
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => {
+                    // Отправляем кадр на обработку в модель Pose
+                    await pose.send({image: videoElement});
+                },
+                width: 1280, // Запрашиваем высокое разрешение для лучшего трекинга
+                height: 720
+            });
+            
+            cameraUtils.start().catch(err => {
+                console.error(err);
+                statusContent.innerHTML = "<h2>Ошибка Камеры</h2><p>Не удалось получить доступ к веб-камере. Пожалуйста, проверьте разрешения браузера и перезагрузите страницу.</p>";
+                statusOverlay.style.display = 'flex';
+                statusOverlay.style.opacity = 1;
+            });
+        }
+
+        start();
+
+    </script>
+</body>
+</html>
